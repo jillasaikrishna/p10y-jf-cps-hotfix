@@ -175,6 +175,10 @@ boolean isDockerOnly()     { return env.docker_only?.toBoolean() }
 // config.frontend_dashboard_stages is true, Checkout/Build are replaced by named stages from
 // config.pipeline_stages (plus Fetch constants / Checkout from Repository).
 boolean frontendDashboard() {
+    // Prefer env (set in environment{}) so when{} expressions work under CPS Binding.
+    if (env.frontend_dashboard_stages != null && env.frontend_dashboard_stages.toString() != '') {
+        return env.frontend_dashboard_stages.toBoolean()
+    }
     return config?.frontend_dashboard_stages == true ||
         config?.frontend_dashboard_stages?.toString()?.equalsIgnoreCase('true')
 }
@@ -423,8 +427,10 @@ String findEnvironmentInUrl(String jenkinsUrl, Map environmentConfig) {
     return null
 }
 
-// Generate configuration from JSON
-def config
+// Generate configuration from JSON.
+// @Field so helper methods (frontendDashboard, findPipelineStage, checkoutAppRepo, …)
+// can see config under CPS; a plain `def` is only local to the script run() Binding.
+@groovy.transform.Field def config
 // Jenkins readJSON returns JSONNull for missing keys; JSONNull.toString() == "null".
 // This helper coerces missing/null/blank config values to '' so the environment block
 // never leaks the literal string "null" into env vars.
@@ -693,6 +699,7 @@ pipeline {
         go_binary_name = "${config.go_binary_name ?: ''}"
         run_build_stage = "${config.run_build_stage != null ? config.run_build_stage : true}"
         docker_only = "${config.docker_only ?: false}"
+        frontend_dashboard_stages = "${config.frontend_dashboard_stages ?: false}"
         run_archive_stage = "${config.run_archive_stage ?: false}"
         run_tests = "${params.RUN_TESTS ?: config.run_tests ?: false}"
         run_tests_before_build = "${config.run_tests_before_build ?: false}"
