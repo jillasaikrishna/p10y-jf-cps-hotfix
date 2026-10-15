@@ -1,0 +1,1085 @@
+// NCM products multi-branch pipeline (frontend / branch-indexed jobs).
+// Used when a service cannot be modeled as a single demo/prod pipelineJob with a
+// fixed github_branch. Jenkins Multi-Branch sets BRANCH_NAME and checks out that
+// branch via `checkout scm`; JOB_BASE_NAME is the branch, not the service name.
+// Job path: NCM_PRODUCTS/<product>/<lang>/multibranch/<service>/<branch>
+// Load pipeline-configuration library
+def pipeline_configuration_tag = env.RJPP_BRANCH ?: params.release_tag ?: 'beam-cg-common-reports'
+if (!env.RJPP_BRANCH) {
+    if (params.release_tag) {
+        echo "WARNING: RJPP_BRANCH is not set, using release_tag ${params.release_tag}"
+    } else {
+        echo "WARNING: RJPP_BRANCH is not set, using default ${pipeline_configuration_tag}"
+    }
+}
+env.pipeline_configuration_repo = 'git@github.com:nutanix-release-engineering/p10y-pipeline-configuration.git'
+def pipeline_configuration_credentials = 'SSH-KEY'
+library identifier: "pipeline-configuration@${pipeline_configuration_tag}",
+        retriever: modernSCM([
+            $class: 'GitSCMSource',
+            remote: pipeline_configuration_repo,
+            credentialsId: pipeline_configuration_credentials,
+            extensions: [[$class: 'DisableRemotePoll']]
+        ])
+def pipeline_configuration_scm = [
+    $class: 'GitSCM',
+    branches: [[name: pipeline_configuration_tag]],
+    userRemoteConfigs: [[
+        url: pipeline_configuration_repo,
+        credentialsId: pipeline_configuration_credentials
+    ]]
+]
+// =============================================================================
+// Language shared-library globals
+// =============================================================================
+// Per-language logic lives in the shared library so this Jenkinsfile stays a thin language dispatcher:
+//   - goToolchain (vars/goToolchain.groovy): Go toolchain selection via gvm (Go Version Manager).
+//     Installs the required Go version on-demand, honors go.mod's 'toolchain' pin, enforces
+//     GOTOOLCHAIN=local. Used as goToolchain.resolveRoot(lang) / goToolchain.environment(...).
+//   - goBuild (vars/goBuild.groovy): Go build/test/archive orchestration — goBuild.execute/runCustom/test/archive.
+//   - pythonBuild (vars/pythonBuild.groovy): Python build/test/archive orchestration —
+//     pythonBuild.execute/test/archive.
+//   - javaBuild (vars/javaBuild.groovy): Java build/test/archive orchestration (LANG->JAVA_HOME map,
+//     maven/gradle selection) — javaBuild.execute/runCustom/test/archive.
+
+// Resolves the per-language shared library for a LANG (goBuild/javaBuild/pythonBuild), which all
+// expose the same execute(config, lang) / test(config, lang) / archive(config) surface. Returns
+// null for an unsupported LANG so callers can decide whether that's an error or a warning. This is
+// the single place the language dispatch lives — build/test/archive all route through it.
+def langLib(String lang) {
+    if (lang?.startsWith('go'))     { return goBuild }
+    if (lang?.startsWith('java'))   { return javaBuild }
+    if (lang?.startsWith('python')) { return pythonBuild }
+    return null
+}
+
+// Helper method to execute build based on language
+def executeBuild(config) {
+    def lang = (env.LANG ?: config.LANG).toLowerCase()
+    echo "Executing build for language: ${lang}"
+    sh "echo Hostname: \$(hostname)"
+    if (config.custom_build_command) {
+        // readJSON returns net.sf.json.JSONArray. Its join() JSON-quotes each
+        // element, so sh sees one argv ("JAVA_HOME=... ./activator ...") and
+        // exits 127. Copy elements to a plain list first; Groovy join does not
+        // add quotes. Join with && (not newlines): a multiline sh script can
+        // also be parsed as a single argv (same exit 127). Plain strings,
+        // including those already using &&, still work unchanged.
+        def rawCmd = config.custom_build_command
+        def cmd
+        if (rawCmd instanceof Collection) {
+            def parts = []
+            rawCmd.each { item ->
+                if (item != null) {
+                    def text = item.toString().trim()
+                    if (text && text != 'null') {
+                        parts << text
+                    }
+                }
+            }
+            cmd = parts.join(' && ')
+        } else {
+            cmd = rawCmd.toString()
+        }
+        echo "Running custom build command: ${cmd}"
+        // Go runs custom commands inside its toolchain env.
+        // A selected Java LANG rewrites JAVA_HOME in the command (config paths stay
+        // when the LANG parameter is left empty). Other languages run the command as-is.
+        if (lang.startsWith('go')) {
+            goBuild.runCustom(config, lang, cmd)
+        } else if (lang.startsWith('java') && params.LANG?.trim()) {
+            javaBuild.runCustom(lang, cmd)
+        } else {
+            sh script: cmd.toString()
+        }
+        return
+    }
+    def lib = langLib(lang)
+    if (!lib) {
+        error "Unsupported LANG: ${env.LANG ?: config.LANG}. Supported values: JAVA*, go*, PYTHON*"
+    }
+    lib.execute(config, lang)
+}
+// Helper method to run tests based on language
+def runTests(config) {
+    def lang = (env.LANG ?: config.LANG).toLowerCase()
+    def lib = langLib(lang)
+    if (lib) {
+        lib.test(config, lang)
+    } else {
+        echo "WARNING: No test runner configured for LANG: ${env.LANG ?: config.LANG}"
+    }
+}
+
+// Runs the configured test flow (hooks + optional docker registry auth + language test command).
+// ECR auth mirrors dockerBuild (aws ecr get-login-password) — Docker Pipeline's
+// `docker.withRegistry` is not available in this Jenkins (MissingPropertyException on `docker`).
+def executeTestFlow(config) {
+    runCustomStages(config, 'before_test')
+    def testRegistry = config.test_docker_registry?.trim()
+    if (testRegistry) {
+        echo "Running tests with Docker registry auth: ${testRegistry}"
+        def registryHost = testRegistry.replaceFirst(/^https?:\/\//, '')
+        // Prefer explicit "ecr:<region>:<credentialsId>"; else use commercial ECR creds.
+        def testRegistryCred = config.test_docker_credentials?.trim() ?: ''
+        def ecrRegion = 'us-west-2'
+        def ecrCredId = 'docker-ecr-credentials'
+        def credParts = testRegistryCred ? testRegistryCred.tokenize(':') : []
+        if (credParts.size() == 3 && credParts[0] == 'ecr') {
+            ecrRegion = credParts[1]
+            ecrCredId = credParts[2]
+        } else if (testRegistryCred) {
+            ecrCredId = testRegistryCred
+        }
+        withCredentials([usernamePassword(
+            credentialsId: ecrCredId,
+            usernameVariable: 'AWS_ACCESS_KEY_ID',
+            passwordVariable: 'AWS_SECRET_ACCESS_KEY'
+        )]) {
+            withEnv(["ECR_REGISTRY=${registryHost}", "ECR_REGION=${ecrRegion}"]) {
+                sh 'aws ecr get-login-password --region "$ECR_REGION" | docker login -u AWS --password-stdin "$ECR_REGISTRY"'
+            }
+            runTests(config)
+        }
+    } else {
+        runTests(config)
+    }
+    runCustomStages(config, 'after_test')
+}
+// Helper method to archive build artifacts based on language
+def archiveBuildArtifacts(config) {
+    def lang = (env.LANG ?: config.LANG).toLowerCase()
+    echo "Archiving build artifacts for language: ${lang}"
+    def lib = langLib(lang)
+    if (lib) {
+        lib.archive(config)
+    } else {
+        echo "WARNING: No artifact archiving configured for LANG: ${env.LANG ?: config.LANG}"
+    }
+}
+
+// Stage-gating helpers — centralize the stagesToRun / run_security_scan logic used by the stage
+// `when` conditions, so the (otherwise duplicated and doubly-negated) expressions stay readable.
+boolean ciSelected()       { return env.stagesToRun == 'ALL' || env.stagesToRun == 'CI' }
+boolean cdSelected()       { return env.stagesToRun == 'ALL' || env.stagesToRun == 'CD' }
+boolean securitySelected() { return ciSelected() || env.run_security_scan.toBoolean() }
+// Harbor/SonarQube run with the security set, but never on a pure CD security-scan pass.
+boolean scanStageEnabled() { return securitySelected() && !(env.run_security_scan.toBoolean() && env.stagesToRun == 'CD') }
+// Docker-only services (config key "docker_only": true) ship a prebuilt/third-party image whose
+// Dockerfile does everything — there is no source to compile. Skip the Build/Test/Archive stages
+// for them while still running Docker Build + the security/harbor scans.
+boolean isDockerOnly()     { return env.docker_only?.toBoolean() }
+
+// Frontend Multibranch dashboards (bm-dashboard-*) mirror the original NCM team Jenkinsfiles
+// (nxengg) stage names while keeping this file as the only source of truth. When
+// config.frontend_dashboard_stages is true, Checkout/Build are replaced by named stages from
+// config.pipeline_stages (plus Fetch constants / Checkout from Repository).
+boolean frontendDashboard() {
+    return config?.frontend_dashboard_stages == true ||
+        config?.frontend_dashboard_stages?.toString()?.equalsIgnoreCase('true')
+}
+
+boolean cfgBool(v, boolean defaultVal = false) {
+    if (v == null) { return defaultVal }
+    if (v instanceof Boolean) { return v }
+    return v.toString().equalsIgnoreCase('true')
+}
+
+def joinShellCommands(cmds) {
+    if (cmds instanceof Collection) {
+        def parts = []
+        cmds.each { item ->
+            if (item != null) {
+                def text = item.toString().trim()
+                if (text && text != 'null') {
+                    parts << text
+                }
+            }
+        }
+        return parts.join(' && ')
+    }
+    return cmds?.toString() ?: ''
+}
+
+boolean pipelineStageWhenMatches(stageDef) {
+    def w = stageDef?.when
+    if (!(w instanceof Map) || w.isEmpty()) {
+        return true
+    }
+    def branch = (env.BRANCH_NAME ?: '').toString()
+    def envtype = (env.ENVTYPE ?: '').toString()
+    // CPS does not support the Groovy spread operator (*.); map explicitly.
+    if (w.branch_in instanceof Collection) {
+        def branchIn = w.branch_in.collect { it?.toString() }
+        if (!(branch in branchIn)) {
+            return false
+        }
+    }
+    if (w.branch_not_in instanceof Collection) {
+        def branchNotIn = w.branch_not_in.collect { it?.toString() }
+        if (branch in branchNotIn) {
+            return false
+        }
+    }
+    if (w.branch_equals && branch != w.branch_equals.toString()) {
+        return false
+    }
+    if (w.branch_not_equals && branch == w.branch_not_equals.toString()) {
+        return false
+    }
+    if (w.envtype && envtype != w.envtype.toString()) {
+        return false
+    }
+    if (w.envtype_not && envtype == w.envtype_not.toString()) {
+        return false
+    }
+    return true
+}
+
+def findPipelineStage(String name) {
+    def stages = config?.pipeline_stages
+    if (!(stages instanceof Collection)) {
+        return null
+    }
+    return stages.find { it?.name?.toString() == name }
+}
+
+boolean pipelineStageActive(String name, String phase) {
+    if (!frontendDashboard()) {
+        return false
+    }
+    def stageDef = findPipelineStage(name)
+    if (!stageDef) {
+        return false
+    }
+    def stagePhase = (stageDef.phase ?: 'ci').toString()
+    if (stagePhase != phase) {
+        return false
+    }
+    if (phase == 'ci' && !ciSelected()) {
+        return false
+    }
+    if (phase == 'cd' && !cdSelected()) {
+        return false
+    }
+    return pipelineStageWhenMatches(stageDef)
+}
+
+def runPipelineStageCommands(String name) {
+    def stageDef = findPipelineStage(name)
+    if (!stageDef) {
+        error "pipeline_stages entry not found for '${name}'"
+    }
+    def cmd = joinShellCommands(stageDef.commands)
+    if (!cmd) {
+        echo "No commands for pipeline stage '${name}'"
+        return
+    }
+    echo "Running pipeline stage '${name}': ${cmd}"
+    sh script: cmd
+}
+
+def checkoutAppRepo() {
+    def checkoutBranch = env.BRANCH_NAME ?: env.github_branch
+    echo "Checking out from GitHub: ${config.repo_url}"
+    echo "Branch: ${checkoutBranch} (BRANCH_NAME=${env.BRANCH_NAME})"
+    if (env.BRANCH_NAME) {
+        checkout scm
+    } else {
+        checkout scmGit(branches: [[name: "refs/heads/${checkoutBranch}"]],
+                    extensions: [[$class: 'CleanBeforeCheckout']],
+                    userRemoteConfigs: [[url: "${config.repo_url}",
+                    credentialsId: 'jenkins-github-creds']])
+    }
+}
+
+def checkoutSubmodules() {
+    def checkoutBranch = env.BRANCH_NAME ?: env.github_branch
+    if (!config.submodules) {
+        return
+    }
+    config.submodules.each { sub ->
+        def subDir = sub.dir ?: sub.repo_url.tokenize('/').last().replaceAll(/\.git$/, '')
+        def subBranch = sub.branch ?: checkoutBranch
+        echo "Checking out sub-module ${subDir} from ${sub.repo_url} @ ${subBranch}"
+        checkout scmGit(
+            branches: [[name: "refs/heads/${subBranch}"]],
+            extensions: [[$class: 'CleanBeforeCheckout'],
+                         [$class: 'RelativeTargetDirectory', relativeTargetDir: subDir]],
+            userRemoteConfigs: [[url: sub.repo_url, credentialsId: 'jenkins-github-creds']]
+        )
+    }
+}
+
+// Runs config-driven custom stages placed at a given hook point. Each entry in
+// config.custom_stages that matches the hook becomes its own named Jenkins stage
+// (scripted, so it only appears in the pipeline UI when it actually runs).
+// The stage name, commands, and optional teardown are all defined in the job's JSON
+// config — nothing is hardcoded here. Jobs without custom_stages are unaffected.
+//
+// Config format (in the job's JSON):
+//   "custom_stages": [
+//     {
+//       "name":     "Create Kind Cluster",        <- appears as the Jenkins stage name
+//       "hook":     "after_checkout",              <- when to run (see hooks below)
+//       "commands": ["cmd1", "cmd2", ...],         <- shell commands (list or single string)
+//       "teardown": ["cleanup1", ...],             <- optional: runs in post.always block
+//       "requires_run_tests": true,                <- optional: skip when RUN_TESTS/run_tests is false
+//     }
+//   ]
+//
+// Available hooks (between the standard declarative stages):
+//   after_checkout  — after Checkout, before Build
+//   before_test     — after Build, before Test
+//   after_test      — after Test, before Archive/Docker
+def customStageShouldRun(customStage) {
+    // Stages that only exist to support tests (e.g. Kind cluster) should not run
+    // when RUN_TESTS/run_tests is false.
+    if (customStage.requires_run_tests && !env.run_tests?.toBoolean()) {
+        return false
+    }
+    return true
+}
+
+def runCustomStages(config, String hook) {
+    def stages = config.custom_stages
+    if (!stages) { return }
+    stages.findAll { it.hook == hook }.each { customStage ->
+        if (!customStageShouldRun(customStage)) {
+            echo "Skipping custom stage '${customStage.name}' (requires_run_tests=true, run_tests=${env.run_tests})"
+            return
+        }
+        stage(customStage.name) {
+            echo "Running custom stage: ${customStage.name}"
+            def cmds = customStage.commands
+            def runCommands = {
+                if (cmds instanceof List) {
+                    cmds.each { cmd -> sh cmd }
+                } else {
+                    sh "${cmds}"
+                }
+            }
+            if (customStage.requires_go_toolchain) {
+                def lang = (env.LANG ?: config.LANG).toLowerCase()
+                def goRoot = goToolchain.resolveRoot(lang)
+                withEnv(goToolchain.environment(goRoot, null)) {
+                    runCommands()
+                }
+            } else {
+                runCommands()
+            }
+        }
+    }
+}
+
+// Runs teardown commands from custom_stages entries that defined a "teardown" key.
+// Called in the post.always block so cleanup runs after the entire pipeline, even on failure.
+def runCustomStageTeardowns(config) {
+    def stages = config.custom_stages
+    if (!stages) { return }
+    stages.findAll { it.teardown }.each { customStage ->
+        if (!customStageShouldRun(customStage)) {
+            echo "Skipping teardown for '${customStage.name}' (requires_run_tests=true, run_tests=${env.run_tests})"
+            return
+        }
+        echo "Running teardown for '${customStage.name}'"
+        def cmds = customStage.teardown
+        def runCommands = {
+            if (cmds instanceof List) {
+                cmds.each { cmd -> sh cmd }
+            } else {
+                sh "${cmds}"
+            }
+        }
+        if (customStage.requires_go_toolchain) {
+            def lang = (env.LANG ?: config.LANG).toLowerCase()
+            def goRoot = goToolchain.resolveRoot(lang)
+            withEnv(goToolchain.environment(goRoot, null)) {
+                runCommands()
+            }
+        } else {
+            runCommands()
+        }
+    }
+}
+
+// Helper method to extract environment variables from Jenkins URL
+@NonCPS
+String findEnvironmentInUrl(String jenkinsUrl, Map environmentConfig) {
+    if (!jenkinsUrl || !environmentConfig) {
+        return null
+    }
+
+    // Convert URL to lowercase for case-insensitive matching
+    String urlLower = jenkinsUrl.toLowerCase()
+
+    // Check each environment key from service_url.json
+    for (envKey in environmentConfig.keySet()) {
+        if (urlLower.contains(envKey.toLowerCase())) {
+            return envKey
+        }
+    }
+
+    return null
+}
+
+// Generate configuration from JSON
+def config
+// Jenkins readJSON returns JSONNull for missing keys; JSONNull.toString() == "null".
+// This helper coerces missing/null/blank config values to '' so the environment block
+// never leaks the literal string "null" into env vars.
+def cfgStr = { v -> def s = v?.toString()?.trim(); (s && s != 'null') ? s : '' }
+def agentLabel = 'UBUNTU'
+node('LIGHT') {
+    checkout scm: pipeline_configuration_scm, poll: false
+    Map jsonData = readJSON text: readFile("${env.WORKSPACE}/python_utils/service_url.json")
+    String environment = findEnvironmentInUrl(env.JENKINS_URL, jsonData)
+    if (environment) {
+        echo "Detected environment '${environment}' from JENKINS_URL: ${env.JENKINS_URL}"
+        echo "Loading environment configuration for: ${environment}"
+        jsonData[environment].each { key, value ->
+            env[key] = value
+        }
+        echo "Successfully loaded ${jsonData[environment].size()} environment variables"
+        echo "env vars for ${environment}: ${jsonData[environment]}"
+    } else {
+        def availableEnvs = jsonData.keySet().join(", ")
+        error("Could not detect environment from JENKINS_URL: ${env.JENKINS_URL}\nAvailable environments in service_url.json: ${availableEnvs}\nBuild cannot proceed.")
+    }
+    boolean isTestEnvironment = environment != 'prod'
+    mockEmail = isTestEnvironment
+    mockSlack = isTestEnvironment
+    // Release variant selects which config the build uses. It is derived purely from the
+    // folder the job lives in (there is no user-facing param), so an onprem job can never
+    // be run against the SaaS/global config by mistake:
+    //   NCM_PRODUCTS/<product>/<lang>/onprem/... => onprem overlay; demo/prod => global.
+    def releaseBinary = (env.JOB_NAME?.contains('/onprem/')) ? 'onprem' : 'global'
+    // NCM_DOCKER_ENVTAG (from service_url.json, e.g. "devprod-delta") overrides per-service
+    // envtag for ECR image tags. Demo/prod and onprem jobs share the same Jenkins BUILD_ID
+    // namespace, so without a distinct suffix a colliding build number overwrites the other
+    // variant's ECR tag. Append "-onprem" for onprem jobs (e.g. "devprod-delta-onprem").
+    if (env.NCM_DOCKER_ENVTAG && releaseBinary == 'onprem') {
+        env.NCM_DOCKER_ENVTAG = "${env.NCM_DOCKER_ENVTAG}-onprem"
+        echo "Onprem job: NCM_DOCKER_ENVTAG set to '${env.NCM_DOCKER_ENVTAG}'"
+    }
+    echo "environment='${environment}', isTestEnvironment=${isTestEnvironment}, agentLabel='${agentLabel}'"
+    echo "Release variant: '${releaseBinary}' (JOB_NAME='${env.JOB_NAME}')"
+    echo "env_json: ${jsonData[environment]}"
+    // Multi-branch jobs are NCM_PRODUCTS/<product>/<lang>/multibranch/<service>/<branch>.
+    // JOB_BASE_NAME is the git branch (dev, master, qa4), not the service name.
+    def jobParts = (env.JOB_NAME ?: '').tokenize('/')
+    def ncmIdx = jobParts.findIndexOf { it == 'NCM_PRODUCTS' || it == 'ncm_products' }
+    def serviceName = env.JOB_BASE_NAME
+    if (ncmIdx >= 0 && jobParts.size() >= ncmIdx + 5) {
+        serviceName = jobParts[ncmIdx + 4]
+    } else if (jobParts.size() >= 2) {
+        serviceName = jobParts[-2]
+    }
+    echo "Multi-branch service name: '${serviceName}' (BRANCH_NAME='${env.BRANCH_NAME}')"
+    // Load the service JSON directly. Falcon get_parent(JOB_BASE_NAME) would look up the
+    // git branch (dev/master/qa4), not the service, so the shared Python generator cannot
+    // be used as-is for Multi-branch jobs.
+    def product = (ncmIdx >= 0 && jobParts.size() > ncmIdx + 1) ? jobParts[ncmIdx + 1] : ''
+    def lang = (ncmIdx >= 0 && jobParts.size() > ncmIdx + 2) ? jobParts[ncmIdx + 2] : ''
+    def cfgPath = "ncm_products/${product}/${lang}/configuration.${serviceName}.json"
+    if (!fileExists(cfgPath)) {
+        error("Multi-branch config not found at ${cfgPath} (JOB_NAME='${env.JOB_NAME}')")
+    }
+    def rawCfg = readJSON file: cfgPath
+    config = [:]
+    def defaultsPath = "ncm_products/${product}/_defaults.json"
+    if (fileExists(defaultsPath)) {
+        def defaults = readJSON file: defaultsPath
+        defaults.each { k, v ->
+            if (k != '_comment') { config[k] = v }
+        }
+    }
+    if (rawCfg.global instanceof Map) {
+        rawCfg.global.each { k, v -> config[k] = v }
+    }
+    if (releaseBinary != 'global' && rawCfg[releaseBinary] instanceof Map) {
+        rawCfg[releaseBinary].each { k, v -> config[k] = v }
+    }
+    echo "Configuration loaded from ${cfgPath}: ${config}"
+    
+    dir("${WORKSPACE}") {
+        deleteDir()
+    }
+}
+// Declarative pipeline
+pipeline {
+    agent {
+        label agentLabel
+    }
+    options {
+        skipDefaultCheckout(true)
+        timeout(time: 60, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+        disableConcurrentBuilds()
+    }
+    parameters {
+        string(
+            name: 'envTag',
+            defaultValue: '',
+            description: 'Environment tag for the build (e.g. demo, qa, prod). Leave empty to use config value.'
+        )
+        string(
+            name: 'branch',
+            defaultValue: '',
+            description: 'Branch to build/checkout (e.g. master, develop, test-chronus). Leave empty to use config value.'
+        )
+        string(
+            name: 'VICTORIA_METRICS_VERSION',
+            defaultValue: '',
+            description: 'VictoriaMetrics version to use for the build (e.g. v1.144.0). Leave empty to use config value.'
+        )
+        string(
+            name: 'OTEL_VERSION',
+            defaultValue: '',
+            description: 'OpenTelemetry Collector version to use for the build (e.g. 0.143.0). Leave empty to use config value.'
+        )
+        string(
+            name: 'VALKEY_BASE_IMAGE',
+            defaultValue: '',
+            description: 'Valkey runtime base image override (e.g. 981042990700.dkr.ecr.us-west-2.amazonaws.com/valkey/valkey:8.1.7). Leave empty to use config value; leave empty for non-Valkey jobs (skipped when blank).'
+        )
+        string(
+            name: 'RUNTIME_IMAGE',
+            defaultValue: '',
+            description: 'Final-stage Docker runtime image override (e.g. 981042990700.dkr.ecr.us-west-2.amazonaws.com/distroless/static:nonroot). Leave empty to use config runtime_image; leave empty for jobs that do not use ARG runtime_image (skipped when blank).'
+        )
+        string(
+            name: 'VALKEY_EXPORTER_IMAGE',
+            defaultValue: '',
+            description: 'Valkey/redis exporter image override for coverage tests (e.g. 981042990700.dkr.ecr.us-west-2.amazonaws.com/oliver006/redis_exporter:v1.69.0). Leave empty to use config VALKEY_EXPORTER_IMAGE; leave empty for non-Valkey jobs (skipped when blank).'
+        )
+        string(
+            name: 'COVERAGE_RUNTIME_IMAGE',
+            defaultValue: '',
+            description: 'Coverage-test runtime image override (e.g. 981042990700.dkr.ecr.us-west-2.amazonaws.com/alpine:3.18). Leave empty to use config coverage_runtime_image; leave empty for jobs that do not use coverage runtime (skipped when blank).'
+        )
+        string(
+            name: 'config_branch_override',
+            defaultValue: '',
+            description: 'onprem only: name of a config section to overlay for the build recipe (e.g. ncm-2.1-release). The branch above is still what gets checked out; this only selects which section supplies go_build_targets/OS/etc., so a newly cut branch can reuse an existing section without adding its own. Leave empty to use the plain onprem config. Ignored for demo/prod.'
+        )
+        choice(
+            name: 'ENV',
+            choices: ['', 'QA1', 'QA2', 'QA3', 'QA4', 'DEV1', 'DEV2', 'DEV3', 'DEV4', 'PROD', 'GOVDEV', 'GOVPROD', 'DEMO', 'QA1-CODE-REVIEW', 'STAGING1', 'STAGING2', 'STAGING3'],
+            description: 'Target environment (QA1, QA2, PROD, etc.). Leave empty to use config value.'
+        )
+        choice(
+            name: 'LANG',
+            choices: ['', 'go1201', 'go1210', 'go12210', 'go1255', 'go12511', 'go12512', 'JAVA8', 'JAVA11', 'JAVA17', 'JAVA21', 'PYTHON37', 'PYTHON39', 'PYTHON310', 'PYTHON311', 'PYTHON312', 'PYTHON313', 'PYTHON314'],
+            description: 'Language/runtime (Go versions are installed on-demand via gvm: go1201=1.20.1, go1210=1.21.0, go12210=1.22.10, go1255=1.25.5, go12511=1.25.11, go12512=1.25.12. Any version pinned in go.mod toolchain directive is also auto-installed; JAVA8, JAVA11, etc.)  Leave empty to use config value.'
+        )
+        string(
+            name: 'ECR_REPO_NAME',
+            defaultValue: '',
+            description: 'ECR repository name (e.g. hawkeye-service). Leave empty to use config value.'
+        )
+        choice(
+            name: 'mergeStatus',
+            choices: ['', 'TRUE', 'FALSE'],
+            description: 'Merge status (TRUE or FALSE). Leave empty to use config value.'
+        )
+        choice(
+            name: 'stagesToRun',
+            choices: ['', 'ALL', 'CI', 'CD'],
+            description: 'Stages to run (ALL, CI, or CD). Leave empty to default to ALL.'
+        )
+        choice(
+            name: 'hookType',
+            choices: ['', 'MERGE', 'COMMENT', 'PULLREQUEST'],
+            description: 'Hook type (MERGE, COMMENT, or PULLREQUEST). Leave empty to default to MERGE.'
+        )
+        string(
+            name: 'K8S_BASE_IMAGE',
+            defaultValue: '',
+            description: 'Custom Docker base image override (e.g. flink:1.16.1-scala_2.12-java8). Leave empty to use LANG-based default.'
+        )
+        choice(
+            name: 'STACK',
+            choices: ['', 'K8s', 'NOMAD'],
+            description: 'Deployment stack. Selects the Docker base image family: K8s -> k8s_base:1.0 family; NOMAD -> base:2.0 family (has supervisor/consul/nomad). Leave empty to use the config value (default K8s).'
+        )
+        string(
+            name: 'MULTI_CLOUD_BRANCH',
+            defaultValue: 'onprem-main',
+            description: 'Branch for the MULTI_CLOUD module (e.g. dev3, qa4, qa1, govdev).'
+        )
+        string(
+            name: 'AWS_BRANCH',
+            defaultValue: 'onprem-main',
+            description: 'Branch for the AWS module (e.g. dev3, qa4, qa1, govdev).'
+        )
+        string(
+            name: 'AZURE_BRANCH',
+            defaultValue: 'onprem-main',
+            description: 'Branch for the AZURE module (e.g. dev3, qa4, qa1, govdev).'
+        )
+        string(
+            name: 'NX_BRANCH',
+            defaultValue: 'onprem-main',
+            description: 'Branch for the NX module (e.g. dev3, qa4, qa1, govdev).'
+        )
+        string(
+            name: 'GCP_BRANCH',
+            defaultValue: 'onprem-main',
+            description: 'Branch for the GCP module (e.g. dev3, qa4, qa1, govdev).'
+        )
+        string(
+            name: 'ec2-fleet',
+            defaultValue: 'ec2-fleet',
+            description: 'Node label for the ec2-fleet agent.'
+        )
+        string(
+            name: 'DOCKERFILE',
+            defaultValue: '',
+            description: 'Dockerfile path to use from the repo (e.g. package/docker/Dockerfile). Leave empty to use the config value (config key "dockerfile"), else defaults to "Dockerfile".'
+        )
+        choice(
+            name: 'OS',
+            choices: ['', 'Ubuntu', 'RHEL'],
+            description: 'Base OS for Docker images. Ubuntu uses Ubuntu-based images; RHEL uses RHEL9-based images. Leave empty to use the config section value.'
+        )
+        string(
+            name: 'sonar_refer_branch',
+            defaultValue: '',
+            description: 'SonarQube reference branch for analysis.'
+        )
+        choice(
+            name: 'RUN_TESTS',
+            choices: ['', 'TRUE', 'FALSE'],
+            description: 'Run test stages (Pre-Build and Post-Build). TRUE = run tests, FALSE = skip tests. Leave empty to use config value (config key "run_tests", defaults to false).'
+        )
+    }
+    environment {
+        // Environment variables for cpaas_common_library
+        // Parameters take precedence over config values; empty params fall back to config
+        ENV = "${params.ENV ?: config.ENV}"
+        LANG = "${params.LANG ?: config.LANG}"
+        // OS: param wins; else the selected config value (global vs onprem overlay); else Ubuntu.
+        // onprem sections set OS=RHEL to match the upstream on-prem Jenkinsfile.
+        OS = "${params.OS ?: config.OS ?: 'Ubuntu'}"
+        // STACK selects the Docker base image family in cpaas_common_library (K8s -> k8s_base:1.0,
+        // NOMAD -> base:2.0). Param wins; else config 'stack'; else K8s (prior default behavior).
+        STACK = "${params.STACK ?: config.stack ?: 'K8s'}"
+        ECR_REPO_NAME = "${params.ECR_REPO_NAME ?: config.ECR_REPO_NAME}"
+        // Prefer NCM_DOCKER_ENVTAG (delta: "devprod-delta", or "…-onprem" for onprem jobs).
+        ENVTAG = "${env.NCM_DOCKER_ENVTAG ?: env.ENVTAG ?: (params.envTag?.trim() ?: config.envtag ?: '')}"
+        VICTORIA_METRICS_VERSION = "${params.VICTORIA_METRICS_VERSION?.trim() ?: cfgStr(config.VICTORIA_METRICS_VERSION)}"
+        OTEL_VERSION = "${params.OTEL_VERSION?.trim() ?: cfgStr(config.OTEL_VERSION)}"
+        // Optional: Valkey jobs set a default in config; all other services leave param + config
+        // empty. dockerBuild/dockerCleanup treat blank as no-op (no pull / build-arg / rmi).
+        VALKEY_BASE_IMAGE = "${params.VALKEY_BASE_IMAGE?.trim() ?: cfgStr(config.VALKEY_BASE_IMAGE)}"
+        // Optional final-stage image for multi-stage Dockerfiles (ARG runtime_image). Param wins
+        // when non-empty; else config runtime_image. Blank = skip pull/build-arg/rmi.
+        RUNTIME_IMAGE = "${params.RUNTIME_IMAGE?.trim() ?: cfgStr(config.runtime_image)}"
+        // Optional: coverage-test images for jobs whose Makefile expects BASE_IMAGE,
+        // COVERAGE_RUNTIME_IMAGE, or VALKEY_EXPORTER_IMAGE (e.g. valkey-operator's
+        // `make merge-test-coverage` / docker-build-coverage). Param wins when non-empty;
+        // else config. Blank for everyone else (no-op).
+        VALKEY_EXPORTER_IMAGE = "${params.VALKEY_EXPORTER_IMAGE?.trim() ?: cfgStr(config.VALKEY_EXPORTER_IMAGE)}"
+        COVERAGE_RUNTIME_IMAGE = "${params.COVERAGE_RUNTIME_IMAGE?.trim() ?: cfgStr(config.coverage_runtime_image)}"
+        BASE_IMAGE = "${cfgStr(config.base_image)}"
+        github_branch = "${env.BRANCH_NAME ?: (params.branch ?: config.github_branch)}"
+        mergeStatus = "${params.mergeStatus ?: config.mergeStatus ?: 'TRUE'}"
+        stagesToRun = "${params.stagesToRun ?: config.stagesToRun ?: 'ALL'}"
+        hookType = "${params.hookType ?: config.hookType ?: 'MERGE'}"
+        sonarqube_properties = "${config.sonarqube_properties ?: ''}"
+        skip_sonarqube = "${config.skip_sonarqube ?: false}"
+        build_dir = "${(config.build_dir instanceof List || config.build_dir instanceof Map) ? '' : (config.build_dir ?: '')}"
+        go_binary_name = "${config.go_binary_name ?: ''}"
+        run_build_stage = "${config.run_build_stage != null ? config.run_build_stage : true}"
+        docker_only = "${config.docker_only ?: false}"
+        run_archive_stage = "${config.run_archive_stage ?: false}"
+        run_tests = "${params.RUN_TESTS ?: config.run_tests ?: false}"
+        run_tests_before_build = "${config.run_tests_before_build ?: false}"
+        docker_build_dir = "${config.docker_build_dir ?: ''}"
+        run_security_scan = "${config.run_security_scan ?: false}"
+        // Security-scan identities — config-driven, with the current Beam values preserved as
+        // defaults in cpaas_common_library when unset. Lets a non-Beam product point at its own
+        // Veracode profile / BlackDuck project / Harbor projects without editing library code.
+        VERACODE_APP_ID = "${config.veracode_app_id ?: ''}"
+        BLACKDUCK_PROJECT_NAME = "${config.blackduck_project_name ?: ''}"
+        HARBOR_PROJECT_GOVDEV = "${config.harbor_project_govdev ?: ''}"
+        HARBOR_PROJECT_GOVPROD = "${config.harbor_project_govprod ?: ''}"
+        HARBOR_PROJECT_COMMDEV = "${config.harbor_project_commdev ?: ''}"
+        HARBOR_PROJECT_COMMPROD = "${config.harbor_project_commprod ?: ''}"
+        // DOCKERFILE: param wins; else config 'dockerfile'; else 'Dockerfile'. Lets services whose
+        // Dockerfile is not at the repo root (e.g. package/docker/Dockerfile) build correctly by default.
+        DOCKERFILE = "${params.DOCKERFILE ?: config.dockerfile ?: 'Dockerfile'}"
+        K8S_BASE_IMAGE = "${params.K8S_BASE_IMAGE ?: config.k8s_base_image ?: ''}"
+        DEBUG_DOCKER_BASE = "${params.DEBUG_DOCKER_BASE ?: config.debug_docker_base ?: false}"
+        // Optional passthrough for docker build flags (example: --network=host).
+        DOCKER_BUILD_EXTRA_ARGS = "${params.DOCKER_BUILD_EXTRA_ARGS ?: config.docker_build_extra_args ?: ''}"
+        // Go environment variables — gvm (Go Version Manager) handles toolchain installation.
+        // GOROOT is set dynamically by goToolchain.environment() during build/test stages;
+        // the value here is a sensible default for any pre-build steps that reference it.
+        GOROOT = "/home/jenkins.svc/.gvm/gos/go1.25.5"
+        GOPATH = "/home/jenkins.svc/go"
+        GOMODCACHE = "/home/jenkins.svc/go/pkg/mod"
+        GOCACHE = "/home/jenkins.svc/go/.cache/go-build"
+        GOTMPDIR = "/home/jenkins.svc/go/.tmp"
+        TMPDIR = "/home/jenkins.svc/go/.tmp"
+        GOPROXY = "${env.ARTIFACTORY_URL}/artifactory/general-upstream-go,direct"
+        // Never auto-download Go toolchains via the Go module proxy. gvm installs the
+        // required version explicitly; GOTOOLCHAIN=local ensures Go itself never reaches
+        // out to fetch a different toolchain at build time.
+        GOTOOLCHAIN = "local"
+        // gvm home directory for the jenkins.svc user.
+        GVM_DIR = "/home/jenkins.svc/.gvm"
+        // Disable the public checksum DB (sum.golang.org) — it is unreachable on network-restricted
+        // nodes. Module hashes are still validated locally against the committed go.sum.
+        GOSUMDB = "off"
+        GOPRIVATE = "github.com/nutanix-beam/*"
+        PATH = "/usr/local/bin:/home/jenkins.svc/.gvm/gos/go1.25.5/bin:/home/jenkins.svc/go/bin:${env.PATH}"
+    }
+    stages {
+        // ------------------------------------------------------------------
+        // Frontend dashboard Multibranch (nxengg stage-name parity)
+        // Driven by config.frontend_dashboard_stages + config.pipeline_stages.
+        // ------------------------------------------------------------------
+        stage('Fetch constants') {
+            when {
+                expression { return frontendDashboard() }
+            }
+            steps {
+                script {
+                    checkoutSubmodules()
+                }
+            }
+        }
+        stage('Checkout from Repository') {
+            when {
+                expression { return frontendDashboard() }
+            }
+            steps {
+                script {
+                    checkoutAppRepo()
+                    sh 'env'
+                }
+            }
+        }
+        stage('Pre Build - Copy constant File Demo') {
+            when {
+                expression { return pipelineStageActive('Pre Build - Copy constant File Demo', 'ci') }
+            }
+            steps {
+                script { runPipelineStageCommands('Pre Build - Copy constant File Demo') }
+            }
+        }
+        stage('Pre Build - Copy Constant file Prod') {
+            when {
+                expression { return pipelineStageActive('Pre Build - Copy Constant file Prod', 'ci') }
+            }
+            steps {
+                script { runPipelineStageCommands('Pre Build - Copy Constant file Prod') }
+            }
+        }
+        stage('Pre Build - Package Install') {
+            when {
+                expression { return pipelineStageActive('Pre Build - Package Install', 'ci') }
+            }
+            steps {
+                script { runPipelineStageCommands('Pre Build - Package Install') }
+            }
+        }
+        stage('Build Demo 1') {
+            when {
+                expression { return pipelineStageActive('Build Demo 1', 'ci') }
+            }
+            steps {
+                script { runPipelineStageCommands('Build Demo 1') }
+            }
+        }
+
+        // Non-frontend checkout must run before the shared Build stage.
+        stage('Checkout') {
+            when {
+                expression { return !frontendDashboard() }
+            }
+            steps {
+                script {
+                    checkoutAppRepo()
+                    checkoutSubmodules()
+
+                    if (config.multi_cluster_modules) {
+                        def moduleCheckouts = [
+                            [name: 'MULTI_CLOUD', branch: params.MULTI_CLOUD_BRANCH ?: 'onprem-main', repo: config.multi_cloud_repo_url],
+                            [name: 'AWS',         branch: params.AWS_BRANCH         ?: 'onprem-main', repo: config.aws_repo_url],
+                            [name: 'AZURE',       branch: params.AZURE_BRANCH       ?: 'onprem-main', repo: config.azure_repo_url],
+                            [name: 'NX',          branch: params.NX_BRANCH          ?: 'onprem-main', repo: config.nx_repo_url],
+                            [name: 'GCP',         branch: params.GCP_BRANCH         ?: 'onprem-main', repo: config.gcp_repo_url],
+                        ]
+                        moduleCheckouts.each { mod ->
+                            if (mod.repo) {
+                                echo "Checking out ${mod.name} module from ${mod.repo} @ ${mod.branch}"
+                                dir("modules/${mod.name.toLowerCase()}") {
+                                    checkout scmGit(
+                                        branches: [[name: "refs/heads/${mod.branch}"]],
+                                        extensions: [[$class: 'CleanBeforeCheckout']],
+                                        userRemoteConfigs: [[url: mod.repo, credentialsId: 'jenkins-github-creds']]
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    runCustomStages(config, 'after_checkout')
+                }
+            }
+        }
+        stage('Test (Pre-Build)') {
+            when {
+                expression {
+                    return !frontendDashboard() && ciSelected() && env.run_tests.toBoolean() && env.run_tests_before_build.toBoolean()
+                }
+            }
+            steps {
+                script {
+                    executeTestFlow(config)
+                }
+            }
+        }
+        stage('Build') {
+            when {
+                expression {
+                    // Generic language Build for non-frontend jobs, OR named frontend "Build" stage
+                    // (root/sc-root). Frontend dashboards set run_build_stage=false.
+                    if (frontendDashboard()) {
+                        return pipelineStageActive('Build', 'ci')
+                    }
+                    return ciSelected() && env.run_build_stage.toBoolean()
+                }
+            }
+            steps {
+                script {
+                    if (frontendDashboard()) {
+                        runPipelineStageCommands('Build')
+                    } else {
+                        executeBuild(config)
+                    }
+                }
+            }
+        }
+        stage('Build Gov') {
+            when {
+                expression { return pipelineStageActive('Build Gov', 'ci') }
+            }
+            steps {
+                script { runPipelineStageCommands('Build Gov') }
+            }
+        }
+        stage('Build Prod') {
+            when {
+                expression { return pipelineStageActive('Build Prod', 'ci') }
+            }
+            steps {
+                script { runPipelineStageCommands('Build Prod') }
+            }
+        }
+        stage('Test') {
+            when {
+                expression {
+                    if (frontendDashboard()) {
+                        return pipelineStageActive('Test', 'ci')
+                    }
+                    return ciSelected() && env.run_tests.toBoolean() && !env.run_tests_before_build.toBoolean()
+                }
+            }
+            steps {
+                script {
+                    if (frontendDashboard()) {
+                        runPipelineStageCommands('Test')
+                    } else {
+                        executeTestFlow(config)
+                    }
+                }
+            }
+        }
+        stage('Deploy Dev') {
+            when {
+                expression { return pipelineStageActive('Deploy Dev', 'cd') }
+            }
+            steps {
+                script { runPipelineStageCommands('Deploy Dev') }
+            }
+        }
+        stage('Deploy Stage') {
+            when {
+                expression { return pipelineStageActive('Deploy Stage', 'cd') }
+            }
+            steps {
+                script { runPipelineStageCommands('Deploy Stage') }
+            }
+        }
+        stage('Deploy Prod') {
+            when {
+                expression { return pipelineStageActive('Deploy Prod', 'cd') }
+            }
+            steps {
+                script { runPipelineStageCommands('Deploy Prod') }
+            }
+        }
+        stage('Deploy Prod Commercial') {
+            when {
+                expression { return pipelineStageActive('Deploy Prod Commercial', 'cd') }
+            }
+            steps {
+                script { runPipelineStageCommands('Deploy Prod Commercial') }
+            }
+        }
+        stage('Deploy Gov') {
+            when {
+                expression { return pipelineStageActive('Deploy Gov', 'cd') }
+            }
+            steps {
+                script { runPipelineStageCommands('Deploy Gov') }
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Default Multi-branch post-build stages (non-frontend-dashboard)
+        // ------------------------------------------------------------------
+        stage('Archive Artifacts') {
+            when {
+                expression {
+                    return !frontendDashboard() && ciSelected() && env.run_archive_stage.toBoolean() && !isDockerOnly()
+                }
+            }
+            steps {
+                script {
+                    archiveBuildArtifacts(config)
+                }
+            }
+        }
+        stage('Docker Build') {
+            when {
+                expression {
+                    return !frontendDashboard() && cdSelected()
+                }
+            }
+            steps {
+                script {
+                    echo "Building Docker image"
+                    echo "Environment: ${env.ENV}"
+                    echo "Language: ${env.LANG}"
+                    echo "ECR Repo: ${env.ECR_REPO_NAME}"
+                    echo "Env Tag: ${env.ENVTAG}"
+                    echo "VictoriaMetrics Version: ${env.VICTORIA_METRICS_VERSION}"
+                    echo "OpenTelemetry Collector Version: ${env.OTEL_VERSION}"
+                    if (env.VALKEY_BASE_IMAGE?.trim()) {
+                        echo "Valkey Base Image: ${env.VALKEY_BASE_IMAGE}"
+                    }
+                    if (env.RUNTIME_IMAGE?.trim()) {
+                        echo "Runtime Image: ${env.RUNTIME_IMAGE}"
+                    }
+                    // Prevent double-prefix Dockerfile paths when the pipeline already
+                    // enters docker_build_dir (e.g. dir('vmbackup') + 'vmbackup/Dockerfile').
+                    def resolvedDockerfile = env.DOCKERFILE ?: 'Dockerfile'
+                    def resolvedDockerBuildDir = env.docker_build_dir?.trim()
+                    if (resolvedDockerBuildDir) {
+                        def dockerBuildDirPrefix = "${resolvedDockerBuildDir.replaceAll('/+$', '')}/"
+                        if (resolvedDockerfile.startsWith(dockerBuildDirPrefix)) {
+                            resolvedDockerfile = resolvedDockerfile.substring(dockerBuildDirPrefix.length())
+                            echo "Normalized DOCKERFILE to '${resolvedDockerfile}' for docker_build_dir='${resolvedDockerBuildDir}'"
+                        }
+                    }
+                    dir(env.docker_build_dir ?: '.') {
+                        dockerBuild(dockerfile: resolvedDockerfile)
+                    }
+                }
+            }
+        }
+        stage('Veracode') {
+            when {
+                expression {
+                    return !frontendDashboard() && securitySelected()
+                }
+            }
+            steps {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    script {
+                        veracodeScan()
+                    }
+                }
+            }
+        }
+        stage('BlackDuck') {
+            when {
+                expression {
+                    return !frontendDashboard() && securitySelected()
+                }
+            }
+            steps {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    script {
+                        blackduckScan()
+                    }
+                }
+            }
+        }
+        stage('Harbor Scan') {
+            when {
+                expression {
+                    return !frontendDashboard() && scanStageEnabled()
+                }
+            }
+            steps {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    script {
+                        harborScan()
+                    }
+                }
+            }
+        }
+        stage('SonarQube') {
+            when {
+                expression {
+                    return !frontendDashboard() && scanStageEnabled() &&
+                           env.sonarqube_properties && env.sonarqube_properties != '' &&
+                           env.skip_sonarqube != 'true'
+                }
+            }
+            steps {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    script {
+                        sonarQubeScan(config.repo_url)
+                    }
+                }
+            }
+        }
+    }
+    
+    post {
+        success {
+            sendEmailSuccess artifactTag: 'CPaaS',
+                            branchName: config.github_branch ?: env.github_branch,
+                            ownerEmails: config.owner_emails
+        }
+        failure {
+            sendEmailFailure branchName: config.github_branch ?: env.github_branch,
+                            ownerEmails: config.owner_emails
+        }
+        always {
+            script {
+                runCustomStageTeardowns(config)
+                echo "Pipeline execution completed"
+                echo "Cleaning up Docker images..."
+                try {
+                    dockerCleanup()
+                } catch (err) {
+                    echo "Docker cleanup failed: ${err}. Continuing..."
+                }
+                echo "Docker cleanup completed."
+            }
+        }
+        cleanup {
+            dir("${env.WORKSPACE}") {
+                deleteDir()
+            }
+        }
+    }
+}
